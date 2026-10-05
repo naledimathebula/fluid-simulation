@@ -1,18 +1,43 @@
-const canvas = document.getElementById("glcanvas");
+// ============================================================
+// HOW A REAL-TIME FLUID SIM WORKS (Jos Stam's "Stable Fluids")
+//
+// We keep two grids of data stored as GPU TEXTURES:
+//   - VELOCITY  (a vector field: which way is the fluid moving)
+//   - DYE       (the color you see: what's IN the fluid)
+//
+// Every frame we run a pipeline of small GPU programs (shaders),
+// each one a full-screen pass that reads the previous frame's
+// textures and writes new ones:
+//
+//   1. CURL + VORTICITY  -> keeps swirly little details alive
+//                            (without this, everything goes smooth/boring)
+//   2. ADVECT VELOCITY   -> the velocity field pushes itself around
+//   3. DIVERGENCE        -> measure where fluid is "piling up"
+//   4. PRESSURE (Jacobi)  -> solve for pressure that cancels that pile-up
+//   5. SUBTRACT GRADIENT -> use pressure to make velocity incompressible
+//                            (fluid can't be created/destroyed - conservation)
+//   6. ADVECT DYE        -> finally, push the COLOR along the velocity field
+//
+// Splats (mouse movement) inject a blob of velocity + color directly
+// into those textures, and the solver takes it from there.
+// ============================================================
+
+const canvas = document.getElementById('glcanvas');
 const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-if (!gl) { document.body.innerHTML = '<p style" color :#fff ; padding :40px">webGL not supported.</p>';}
+if (!gl) { document.body.innerHTML = '<p style="color:#fff;padding:40px">WebGL not supported.</p>'; }
 
 const extLinear = gl.getExtension('OES_texture_half_float_linear');
 const extHalfFloat = gl.getExtension('OES_texture_half_float');
-const textType = extHalfFloat ? extHalfFloat.Half_FLOAT_OES : gl.UNSIGNED_BYTE;
+const texType = extHalfFloat ? extHalfFloat.HALF_FLOAT_OES : gl.UNSIGNED_BYTE;
 
 function resize() {
-    canvas.width = window.innerWidth;
+  canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
   gl.viewport(0, 0, canvas.width, canvas.height);
 }
 window.addEventListener('resize', resize);
- 
+
+// ---- shader helpers ----
 function compile(type, src) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
@@ -36,7 +61,7 @@ function program(vsSrc, fsSrc) {
   }
   return { program: p, uniforms };
 }
- 
+
 const baseVertex = `
   precision highp float;
   attribute vec2 aPos;
@@ -46,11 +71,13 @@ const baseVertex = `
     gl_Position = vec4(aPos, 0.0, 1.0);
   }
 `;
- 
 
+// full-screen quad
 const quad = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, quad);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+// ---- STEP 1: shader programs for each stage of the pipeline ----
 
 const splatShader = program(baseVertex, `
   precision highp float;
@@ -68,7 +95,7 @@ const splatShader = program(baseVertex, `
     gl_FragColor = vec4(base + splat, 1.0);
   }
 `);
- 
+
 const advectionShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -83,7 +110,7 @@ const advectionShader = program(baseVertex, `
     gl_FragColor = dissipation * result;
   }
 `);
- 
+
 const divergenceShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -98,7 +125,7 @@ const divergenceShader = program(baseVertex, `
     gl_FragColor = vec4(div, 0.0, 0.0, 1.0);
   }
 `);
- 
+
 const pressureShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -115,7 +142,7 @@ const pressureShader = program(baseVertex, `
     gl_FragColor = vec4(pressure, 0.0, 0.0, 1.0);
   }
 `);
- 
+
 const gradientSubtractShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -132,7 +159,7 @@ const gradientSubtractShader = program(baseVertex, `
     gl_FragColor = vec4(velocity, 0.0, 1.0);
   }
 `);
- 
+
 const curlShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -147,7 +174,7 @@ const curlShader = program(baseVertex, `
     gl_FragColor = vec4(0.5 * vorticity, 0.0, 0.0, 1.0);
   }
 `);
- 
+
 const vorticityShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -169,7 +196,7 @@ const vorticityShader = program(baseVertex, `
     gl_FragColor = vec4(vel + force * dt, 0.0, 1.0);
   }
 `);
- 
+
 const displayShader = program(baseVertex, `
   precision highp float;
   varying vec2 vUv;
@@ -184,7 +211,7 @@ const displayShader = program(baseVertex, `
     gl_FragColor = vec4(c, 1.0);
   }
 `);
- 
+
 // ---- STEP 2: framebuffers (ping-pong texture pairs) ----
 function createFBO(w, h) {
   gl.activeTexture(gl.TEXTURE0);
@@ -195,7 +222,7 @@ function createFBO(w, h) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, texType, null);
- 
+
   const fbo = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -212,7 +239,7 @@ function createDoubleFBO(w, h) {
     swap() { const t = fbo1; fbo1 = fbo2; fbo2 = t; }
   };
 }
- 
+
 const SIM_RES = 128;
 const DYE_RES = 512;
 let velocity = createDoubleFBO(SIM_RES, SIM_RES);
@@ -220,7 +247,7 @@ let dye = createDoubleFBO(DYE_RES, DYE_RES);
 let divergence = createFBO(SIM_RES, SIM_RES);
 let curl = createFBO(SIM_RES, SIM_RES);
 let pressure = createDoubleFBO(SIM_RES, SIM_RES);
- 
+
 function drawQuad(prog, setup) {
   gl.useProgram(prog.program);
   gl.bindBuffer(gl.ARRAY_BUFFER, quad);
@@ -234,7 +261,7 @@ function bindFBO(target, w, h) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
   gl.viewport(0, 0, w, h);
 }
- 
+
 // ---- STEP 3: splats (mouse injects color + velocity) ----
 function splat(x, y, dx, dy, color) {
   bindFBO(velocity.write, SIM_RES, SIM_RES);
@@ -248,7 +275,7 @@ function splat(x, y, dx, dy, color) {
     gl.uniform1f(u.radius, 0.0025);
   });
   velocity.swap();
- 
+
   bindFBO(dye.write, DYE_RES, DYE_RES);
   drawQuad(splatShader, (u) => {
     gl.activeTexture(gl.TEXTURE0);
@@ -261,7 +288,7 @@ function splat(x, y, dx, dy, color) {
   });
   dye.swap();
 }
- 
+
 // wine palette: deep red or acid green splats
 const palette = [[0.75,0.05,0.15],[0.75,0.05,0.15],[0.15,0.55,0.15],[0.35,0.65,0.1]];
 let lastX = 0.5, lastY = 0.5;
@@ -272,7 +299,7 @@ function pointerSplat(x, y) {
   const c = palette[Math.floor(Math.random() * palette.length)];
   splat(x, y, dx, dy, c);
 }
- 
+
 canvas.addEventListener('mousemove', (e) => {
   pointerSplat(e.clientX / canvas.width, 1.0 - e.clientY / canvas.height);
 });
@@ -280,7 +307,7 @@ canvas.addEventListener('touchmove', (e) => {
   const t = e.touches[0];
   pointerSplat(t.clientX / canvas.width, 1.0 - t.clientY / canvas.height);
 }, { passive: true });
- 
+
 // kick off some motion automatically, like the wine settling into the glass
 function randomSplats(n) {
   for (let i = 0; i < n; i++) {
@@ -290,18 +317,18 @@ function randomSplats(n) {
     splat(x, y, (Math.random() - 0.5) * 8, (Math.random() - 0.5) * 8, c);
   }
 }
- 
+
 // ---- STEP 4: the per-frame solver pipeline ----
 const texelSim = [1 / SIM_RES, 1 / SIM_RES];
 let lastTime = Date.now();
- 
+
 function step() {
   const now = Date.now();
   const dt = Math.min((now - lastTime) / 1000, 0.016);
   lastTime = now;
- 
+
   gl.disable(gl.BLEND);
- 
+
   // 1) curl
   bindFBO(curl, SIM_RES, SIM_RES);
   drawQuad(curlShader, (u) => {
@@ -310,7 +337,7 @@ function step() {
     gl.uniform1i(u.uVelocity, 0);
     gl.uniform2f(u.texelSize, texelSim[0], texelSim[1]);
   });
- 
+
   // 2) vorticity confinement (keeps swirls from smoothing out)
   bindFBO(velocity.write, SIM_RES, SIM_RES);
   drawQuad(vorticityShader, (u) => {
@@ -325,7 +352,7 @@ function step() {
     gl.uniform1f(u.dt, dt);
   });
   velocity.swap();
- 
+
   // 3) divergence
   bindFBO(divergence, SIM_RES, SIM_RES);
   drawQuad(divergenceShader, (u) => {
@@ -334,7 +361,7 @@ function step() {
     gl.uniform1i(u.uVelocity, 0);
     gl.uniform2f(u.texelSize, texelSim[0], texelSim[1]);
   });
- 
+
   // 4) pressure solve (Jacobi iterations)
   for (let i = 0; i < 20; i++) {
     bindFBO(pressure.write, SIM_RES, SIM_RES);
@@ -349,7 +376,7 @@ function step() {
     });
     pressure.swap();
   }
- 
+
   // 5) subtract pressure gradient -> divergence-free velocity
   bindFBO(velocity.write, SIM_RES, SIM_RES);
   drawQuad(gradientSubtractShader, (u) => {
@@ -362,7 +389,7 @@ function step() {
     gl.uniform2f(u.texelSize, texelSim[0], texelSim[1]);
   });
   velocity.swap();
- 
+
   // 6) advect velocity through itself
   bindFBO(velocity.write, SIM_RES, SIM_RES);
   drawQuad(advectionShader, (u) => {
@@ -375,7 +402,7 @@ function step() {
     gl.uniform1f(u.dissipation, 0.992);
   });
   velocity.swap();
- 
+
   // 7) advect dye through the velocity field
   bindFBO(dye.write, DYE_RES, DYE_RES);
   drawQuad(advectionShader, (u) => {
@@ -390,7 +417,7 @@ function step() {
     gl.uniform1f(u.dissipation, 0.985);
   });
   dye.swap();
- 
+
   // 8) render dye to the visible canvas
   bindFBO(null, canvas.width, canvas.height);
   drawQuad(displayShader, (u) => {
@@ -398,11 +425,10 @@ function step() {
     gl.bindTexture(gl.TEXTURE_2D, dye.read.tex);
     gl.uniform1i(u.uTexture, 0);
   });
- 
+
   requestAnimationFrame(step);
 }
- 
+
 resize();
 randomSplats(6);
 step();
- 
